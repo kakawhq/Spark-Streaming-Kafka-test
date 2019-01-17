@@ -1,9 +1,9 @@
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.internal.Logging
 import org.apache.spark.streaming.{Seconds, StateSpec, State}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.StringDeserializer
-import kafka.utils.ZkUtils
 import org.apache.spark.streaming.kafka010.{OffsetRange, HasOffsetRanges, KafkaUtils}
 import org.apache.spark.streaming.kafka010.LocationStrategies._
 import org.apache.spark.streaming.kafka010.ConsumerStrategies._
@@ -11,7 +11,7 @@ import scalikejdbc._
 
 
 
-object streaming_kafka_test {
+object streaming_kafka_test extends Logging {
 
   def initConPool(host:String, db:String, User:String, Passwd:String): ConnectionPool.type = {
       Class.forName("com.mysql.jdbc.Driver")    
@@ -20,41 +20,74 @@ object streaming_kafka_test {
   }
 
 
-  def getCommittedOff(pool:ConnectionPool.type, TOPIC_NAME:String, GROUP_ID:String, TableName:String, zkQuorum:String, zkRootDir:String): Map[TopicPartition,Long] = {
-    //get offset in db
-    val table = SQLSyntax.createUnsafely(TableName)
+  def getSavedOff(pool: ConnectionPool.type, topic: String, group: String, tb: String): Map[TopicPartition, Long] = {
+    // get offsets from db
+    val table = SQLSyntax.createUnsafely(tb)
     using(DB(pool.borrow())) { db =>
-      val Off = db.readOnly { implicit session =>      
+      val offs = db.readOnly { implicit session =>
         sql"""select topic, _partition, _offset
               from ${table}
-              where topic = ${TOPIC_NAME} and custom_group = ${GROUP_ID}
+              where topic = ${topic} and custom_group = ${group}
         """
-          .map { resultSet =>          
-            new TopicPartition(resultSet.string(1), resultSet.int(2)) -> resultSet.long(3)        
+          .map { resultSet =>
+            new TopicPartition(resultSet.string(1), resultSet.int(2)) -> resultSet.long(3)
           }.list.apply().toMap
       }
-      val zkUrl = s"${zkQuorum}/${zkRootDir}"
-      val zkClientAndConnection = ZkUtils.createZkClientAndConnection(zkUrl, 10000, 10000)
-      val zkUtils = new ZkUtils(zkClientAndConnection._1, zkClientAndConnection._2, false)
-      val numPartition = zkUtils.getPartitionsForTopics(Seq(TOPIC_NAME)).get(TOPIC_NAME).toList.head.size
-      var fromOffsets = Map[TopicPartition,Long]()
-      if (Off.size == 0) {
-        for (i <- 0 until numPartition) {
-          fromOffsets += (new TopicPartition(TOPIC_NAME, i) -> 0L)
-        }
-        println("init", fromOffsets)
-      } else if(numPartition > Off.size) {
-        fromOffsets = Off
-        for (i <- Off.size until numPartition) {   
-          fromOffsets += (new TopicPartition(TOPIC_NAME, i) -> 0L)
-        }
-        println("add partitions", fromOffsets)
-      } else {
-        fromOffsets = Off
-        println("partitions no change", fromOffsets)
-      }
-      fromOffsets
+      logWarning(s"db saved offsets: ${offs}")
+      offs
     }
+  }
+
+
+  def getTopicOff(broker:String, topic:String): Map[TopicPartition, Seq[Long]] = {
+    // get topic offset ranges
+    val props = new Properties()
+    props.put("bootstrap.servers", broker)
+    props.put("group.id", "offsetHunter")
+    props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+    props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+    val consumer = new KafkaConsumer(props)
+    val postions = consumer
+      .partitionsFor(topic)
+      .asScala
+      .map { t =>
+        val tp = new TopicPartition(t.topic, t.partition)
+        consumer.assign(Seq(tp).asJava)
+        consumer.seekToEnd(Seq(tp).asJava)
+        val lastest_offset = consumer.position(tp)
+        consumer.seekToBeginning(Seq(tp).asJava)
+        val earlist_offset = consumer.position(tp)
+        tp -> Seq(earlist_offset, lastest_offset)
+      }.toMap
+    consumer.close()
+    logWarning(s"kafka postions: ${postions}")
+    postions
+  }
+
+
+  def mergeOff(offs:Map[TopicPartition, Long], postions:Map[TopicPartition, Seq[Long]]): Map[TopicPartition, Long] = {
+    // merge offsets
+    val fromOffsets = offs.isEmpty match {
+      case true => postions.map { case (tp, Seq(s, l)) => tp -> s }
+      case false =>
+        (postions /: offs) { case (map, (k, v)) =>
+          map + (k -> (v +: map.getOrElse(k, Nil)))
+        } filter {
+          case (_, o) => o.size != 1
+        } map {
+          case (tp, o) => tp -> o.sorted.dropRight(1).last
+        }
+    }
+    logWarning(s"partitions and offsets: ${fromOffsets}")
+    fromOffsets
+  }
+
+
+  def getOff(broker_server:String, topics:String, consumer:String, offset_table:String, pool:ConnectionPool.type): Map[TopicPartition, Long] = {
+    // determine the offsets
+    val saved_offsets = getSavedOff(pool, topics, consumer, offset_table)
+    val kafka_postions = getTopicOff(broker_server, topics)
+    mergeOff(saved_offsets, kafka_postions)
   }
 
 
@@ -85,18 +118,17 @@ object streaming_kafka_test {
     val customer_group = "customer1"
     val topics = "test1"
     val table = "kafka_offset"
-    val zkQuorum = "broker1:2181"
-    val zkKafkaRootDir = ""
     val dbHost = "xxx"
     val dbName = "xxx"
     val dbUser = "xxx"
     val dbPasswd = "xxx"
 
-    val spark = SparkSession.builder
-                            .appName("test")
-                            .config("spark.streaming.stopGracefullyOnShutdown", "true")
-                            .config("spark.streaming.kafka.maxRatePerPartition", "10000")
-                            .getOrCreate()
+    val spark = SparkSession
+      .builder
+      .appName("test")
+      .config("spark.streaming.stopGracefullyOnShutdown", "true")
+      .config("spark.streaming.kafka.maxRatePerPartition", "10000")
+      .getOrCreate()
                             
     val sc = spark.sparkContext
     val ssc = new StreamingContext(sc, Seconds(30))
@@ -110,7 +142,7 @@ object streaming_kafka_test {
       "enable.auto.commit" -> (false: java.lang.Boolean))
 
     val pool = initConPool(dbHost, dbName, dbUser, dbPasswd)
-    val fromOffsets = getCommittedOff(pool, topics, customer_group, table, zkQuorum, zkKafkaRootDir)
+    val fromOffsets = getOff(server, topic, consumer, table, mq_pool)
     val stream = KafkaUtils.createDirectStream[String, String](
       ssc,
       PreferConsistent,
